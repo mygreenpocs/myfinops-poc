@@ -1,0 +1,177 @@
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.lang.NonNull;
+import org.springframework.stereotype.Component;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.method.HandlerMethod;
+import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
+import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
+import org.springframework.web.util.ContentCachingResponseWrapper;
+import org.springframework.web.util.pattern.PathPattern;
+
+@Component
+public class TimeLoggerFilter extends OncePerRequestFilter {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(TimeLoggerFilter.class);
+    private static final String TRACE_HEADER = "X-Amzn-Trace-Id";
+    private static final String CONTENT_LENGTH_HEADER = "Content-Length";
+
+    private final RequestMappingHandlerMapping handlerMapping;
+    private final Map<String, EndpointInfo> endpointRegistry = new ConcurrentHashMap<>();
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+    private final List<EndpointPattern> patterns = new ArrayList<>();
+
+    public TimeLoggerFilter(
+            @Qualifier("requestMappingHandlerMapping") RequestMappingHandlerMapping handlerMapping
+    ) {
+        this.handlerMapping = handlerMapping;
+    }
+
+    @PostConstruct
+    void collectEndpoints() {
+        for (Map.Entry<RequestMappingInfo, HandlerMethod> entry : handlerMapping.getHandlerMethods().entrySet()) {
+            RequestMappingInfo mapping = entry.getKey();
+            Set<RequestMethod> methods = mapping.getMethodsCondition().getMethods();
+            if (methods.isEmpty()) {
+                methods = Set.of(RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT,
+                        RequestMethod.PATCH, RequestMethod.DELETE, RequestMethod.HEAD, RequestMethod.OPTIONS);
+            }
+            Set<String> pathPatterns = pathPatterns(mapping);
+            for (String pattern : pathPatterns) {
+                for (RequestMethod method : methods) {
+                    EndpointInfo info = new EndpointInfo(pattern, method.name());
+                    endpointRegistry.put(method.name() + ":" + pattern, info);
+                    patterns.add(new EndpointPattern(pattern, method.name(), info));
+                }
+            }
+        }
+        patterns.sort(Comparator.comparing(EndpointPattern::pattern, pathMatcher.getPatternComparator()));
+        LOGGER.info("TimeLoggerFilter: registered {} REST endpoint pattern(s)", endpointRegistry.size());
+    }
+
+    private static Set<String> pathPatterns(RequestMappingInfo mapping) {
+        if (mapping.getPathPatternsCondition() != null) {
+            return mapping.getPathPatternsCondition().getPatterns().stream()
+                    .map(PathPattern::getPatternString)
+                    .collect(java.util.stream.Collectors.toSet());
+        }
+        if (mapping.getPatternsCondition() != null) {
+            return mapping.getPatternsCondition().getPatterns();
+        }
+        return Set.of();
+    }
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain
+    ) throws ServletException, IOException {
+        long startTime = System.currentTimeMillis();
+        String traceId = request.getHeader(TRACE_HEADER);
+        ContentCachingResponseWrapper wrappedResponse = new ContentCachingResponseWrapper(response);
+        try {
+            filterChain.doFilter(request, wrappedResponse);
+        } finally {
+            if (wrappedResponse.getHeader(CONTENT_LENGTH_HEADER) == null) {
+                int size = wrappedResponse.getContentSize();
+                if (size > 0) {
+                    wrappedResponse.setHeader(CONTENT_LENGTH_HEADER, String.valueOf(size));
+                }
+            }
+            long timeTaken = System.currentTimeMillis() - startTime;
+            int responseBytes = getResponseSize(wrappedResponse);
+            String patternUrl = normalizedPatternUrl(request);
+            LOGGER.info(
+                    "AmznTraceId: {}, method: {}, endpoint: {}, status: {}, responseTime: {} ms, responseBytes: {}, patternUrl: {}",
+                    traceId,
+                    request.getMethod(),
+                    request.getRequestURI(),
+                    wrappedResponse.getStatus(),
+                    timeTaken,
+                    responseBytes,
+                    patternUrl
+            );
+            wrappedResponse.copyBodyToResponse();
+        }
+    }
+
+    private String normalizedPatternUrl(HttpServletRequest request) {
+        String requestPath = requestPath(request);
+        String httpMethod = request.getMethod();
+        EndpointInfo info = resolveEndpoint(requestPath, httpMethod);
+        if (info != null) {
+            return info.httpMethod() + ":" + info.urlPattern();
+        }
+        return "PNM:" + httpMethod + ":" + requestPath;
+    }
+
+    private EndpointInfo resolveEndpoint(String requestPath, String httpMethod) {
+        String exactKey = httpMethod + ":" + requestPath;
+        EndpointInfo exact = endpointRegistry.get(exactKey);
+        if (exact != null) {
+            return exact;
+        }
+        for (EndpointPattern ep : patterns) {
+            if (ep.httpMethod().equals(httpMethod) && pathMatcher.match(ep.pattern(), requestPath)) {
+                return ep.info();
+            }
+        }
+        return null;
+    }
+
+    private static String requestPath(HttpServletRequest request) {
+        String servletPath = request.getServletPath();
+        String pathInfo = request.getPathInfo();
+        if (pathInfo != null) {
+            return servletPath + pathInfo;
+        }
+        if (servletPath != null && !servletPath.isEmpty()) {
+            return servletPath;
+        }
+        String uri = request.getRequestURI();
+        String context = request.getContextPath();
+        if (context != null && !context.isEmpty() && uri.startsWith(context)) {
+            uri = uri.substring(context.length());
+            if (uri.isEmpty()) {
+                return "/";
+            }
+        }
+        return uri;
+    }
+
+    private int getResponseSize(ContentCachingResponseWrapper response) {
+        String contentLength = response.getHeader(CONTENT_LENGTH_HEADER);
+        if (contentLength != null) {
+            try {
+                int length = Integer.parseInt(contentLength);
+                if (length > 0) {
+                    return length;
+                }
+            } catch (NumberFormatException ignored) {
+                // Fall back to cached size below.
+            }
+        }
+        return response.getContentSize();
+    }
+
+    private record EndpointInfo(String urlPattern, String httpMethod) {}
+
+    private record EndpointPattern(String pattern, String httpMethod, EndpointInfo info) {}
+}
